@@ -105,18 +105,34 @@ class WaveformVideoGenerator {
             const totalFrames = Math.ceil(duration * fps);
             const samplesPerFrame = Math.floor(channelData.length / totalFrames);
 
-            const stream = this.canvas.captureStream(fps);
+            const videoStream = this.canvas.captureStream(fps);
+
+            const audioDestination = this.audioContext.createMediaStreamDestination();
+            const audioSource = this.audioContext.createBufferSource();
+            audioSource.buffer = this.audioBuffer;
+            audioSource.connect(audioDestination);
+
+            const combinedStream = new MediaStream([
+                ...videoStream.getVideoTracks(),
+                ...audioDestination.stream.getAudioTracks()
+            ]);
+
             const options = {
-                mimeType: 'video/webm;codecs=vp9',
-                videoBitsPerSecond: 5000000
+                mimeType: 'video/webm;codecs=vp9,opus',
+                videoBitsPerSecond: 5000000,
+                audioBitsPerSecond: 128000
             };
 
             if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-                options.mimeType = 'video/webm;codecs=vp8';
+                options.mimeType = 'video/webm;codecs=vp8,opus';
+            }
+
+            if (!MediaRecorder.isTypeSupported(options.mimeType)) {
+                options.mimeType = 'video/webm';
             }
 
             this.chunks = [];
-            this.mediaRecorder = new MediaRecorder(stream, options);
+            this.mediaRecorder = new MediaRecorder(combinedStream, options);
 
             this.mediaRecorder.ondataavailable = (e) => {
                 if (e.data.size > 0) {
@@ -134,6 +150,8 @@ class WaveformVideoGenerator {
             };
 
             this.mediaRecorder.start();
+            audioSource.start(0);
+
             this.updateProgress(5, '動画の生成中...');
 
             const frameInterval = 1000 / fps;
