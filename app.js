@@ -84,6 +84,11 @@ class WaveformVideoGenerator {
     }
 
     async generateVideo() {
+        if (!('VideoEncoder' in window)) {
+            alert('お使いのブラウザはWebCodecs APIに対応していません。Chrome 94以降をお使いください。');
+            return;
+        }
+
         try {
             this.generateBtn.disabled = true;
             this.progress.style.display = 'block';
@@ -105,78 +110,134 @@ class WaveformVideoGenerator {
             const totalFrames = Math.ceil(duration * fps);
             const samplesPerFrame = Math.floor(channelData.length / totalFrames);
 
-            const videoStream = this.canvas.captureStream(fps);
-
-            const audioDestination = this.audioContext.createMediaStreamDestination();
-            const audioSource = this.audioContext.createBufferSource();
-            audioSource.buffer = this.audioBuffer;
-            audioSource.connect(audioDestination);
-
-            const combinedStream = new MediaStream([
-                ...videoStream.getVideoTracks(),
-                ...audioDestination.stream.getAudioTracks()
-            ]);
-
-            const options = {
-                mimeType: 'video/webm;codecs=vp9,opus',
-                videoBitsPerSecond: 5000000,
-                audioBitsPerSecond: 128000
-            };
-
-            if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-                options.mimeType = 'video/webm;codecs=vp8,opus';
-            }
-
-            if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-                options.mimeType = 'video/webm';
-            }
-
-            this.chunks = [];
-            this.mediaRecorder = new MediaRecorder(combinedStream, options);
-
-            this.mediaRecorder.ondataavailable = (e) => {
-                if (e.data.size > 0) {
-                    this.chunks.push(e.data);
+            const muxer = new WebMMuxer.Muxer({
+                target: new WebMMuxer.ArrayBufferTarget(),
+                video: {
+                    codec: 'V_VP9',
+                    width: width,
+                    height: height,
+                    frameRate: fps
+                },
+                audio: {
+                    codec: 'A_OPUS',
+                    numberOfChannels: this.audioBuffer.numberOfChannels,
+                    sampleRate: this.audioBuffer.sampleRate
                 }
-            };
+            });
 
-            this.mediaRecorder.onstop = () => {
-                const blob = new Blob(this.chunks, { type: 'video/webm' });
-                const url = URL.createObjectURL(blob);
-                this.downloadBtn.href = url;
-                this.downloadLink.style.display = 'block';
-                this.updateProgress(100, '完了！');
-                this.generateBtn.disabled = false;
-            };
-
-            this.mediaRecorder.start();
-            audioSource.start(0);
-
-            this.updateProgress(5, '動画の生成中...');
-
-            const frameInterval = 1000 / fps;
-            let currentFrame = 0;
-
-            const renderFrame = () => {
-                if (currentFrame >= totalFrames) {
-                    this.mediaRecorder.stop();
-                    return;
+            const videoEncoder = new VideoEncoder({
+                output: (chunk, metadata) => {
+                    muxer.addVideoChunk(chunk, metadata);
+                },
+                error: (e) => {
+                    console.error('Video encoding error:', e);
                 }
+            });
 
-                const startSample = currentFrame * samplesPerFrame;
+            videoEncoder.configure({
+                codec: 'vp09.00.10.08',
+                width: width,
+                height: height,
+                bitrate: 5000000,
+                framerate: fps
+            });
+
+            const audioEncoder = new AudioEncoder({
+                output: (chunk, metadata) => {
+                    muxer.addAudioChunk(chunk, metadata);
+                },
+                error: (e) => {
+                    console.error('Audio encoding error:', e);
+                }
+            });
+
+            audioEncoder.configure({
+                codec: 'opus',
+                sampleRate: this.audioBuffer.sampleRate,
+                numberOfChannels: this.audioBuffer.numberOfChannels,
+                bitrate: 128000
+            });
+
+            this.updateProgress(5, '高速レンダリング中...');
+
+            for (let frame = 0; frame < totalFrames; frame++) {
+                const startSample = frame * samplesPerFrame;
                 const endSample = Math.min(startSample + samplesPerFrame, channelData.length);
                 const frameData = channelData.slice(startSample, endSample);
 
                 this.drawWaveform(frameData, waveColor, bgColor, width, height);
 
-                const progress = ((currentFrame + 1) / totalFrames) * 90 + 5;
-                this.updateProgress(progress, `フレーム ${currentFrame + 1}/${totalFrames} を生成中...`);
+                const videoFrame = new VideoFrame(this.canvas, {
+                    timestamp: (frame * 1000000) / fps
+                });
 
-                currentFrame++;
-                setTimeout(renderFrame, frameInterval);
-            };
+                videoEncoder.encode(videoFrame, { keyFrame: frame % 150 === 0 });
+                videoFrame.close();
 
-            renderFrame();
+                const progress = 5 + ((frame + 1) / totalFrames) * 70;
+                this.updateProgress(progress, `フレーム ${frame + 1}/${totalFrames} を処理中...`);
+
+                if (frame % 10 === 0) {
+                    await new Promise(resolve => setTimeout(resolve, 0));
+                }
+            }
+
+            this.updateProgress(80, '音声をエンコード中...');
+
+            const audioData = [];
+            for (let ch = 0; ch < this.audioBuffer.numberOfChannels; ch++) {
+                audioData.push(this.audioBuffer.getChannelData(ch));
+            }
+
+            const frameSize = 960;
+            const totalAudioFrames = Math.ceil(this.audioBuffer.length / frameSize);
+
+            for (let i = 0; i < totalAudioFrames; i++) {
+                const start = i * frameSize;
+                const end = Math.min(start + frameSize, this.audioBuffer.length);
+                const length = end - start;
+
+                const audioFrameData = audioData.map(channel =>
+                    channel.slice(start, end)
+                );
+
+                const audioFrame = new AudioData({
+                    format: 'f32-planar',
+                    sampleRate: this.audioBuffer.sampleRate,
+                    numberOfFrames: length,
+                    numberOfChannels: this.audioBuffer.numberOfChannels,
+                    timestamp: (start / this.audioBuffer.sampleRate) * 1000000,
+                    data: this.interleaveChannels(audioFrameData)
+                });
+
+                audioEncoder.encode(audioFrame);
+                audioFrame.close();
+
+                if (i % 100 === 0) {
+                    const progress = 80 + ((i + 1) / totalAudioFrames) * 15;
+                    this.updateProgress(progress, '音声をエンコード中...');
+                    await new Promise(resolve => setTimeout(resolve, 0));
+                }
+            }
+
+            this.updateProgress(95, 'ファイナライズ中...');
+
+            await videoEncoder.flush();
+            await audioEncoder.flush();
+
+            videoEncoder.close();
+            audioEncoder.close();
+
+            muxer.finalize();
+
+            const { buffer } = muxer.target;
+            const blob = new Blob([buffer], { type: 'video/webm' });
+            const url = URL.createObjectURL(blob);
+
+            this.downloadBtn.href = url;
+            this.downloadLink.style.display = 'block';
+            this.updateProgress(100, '完了！');
+            this.generateBtn.disabled = false;
 
         } catch (error) {
             console.error('動画生成エラー:', error);
@@ -184,6 +245,19 @@ class WaveformVideoGenerator {
             this.generateBtn.disabled = false;
             this.progress.style.display = 'none';
         }
+    }
+
+    interleaveChannels(channelData) {
+        const totalLength = channelData[0].length * channelData.length;
+        const result = new Float32Array(totalLength);
+
+        for (let i = 0; i < channelData[0].length; i++) {
+            for (let ch = 0; ch < channelData.length; ch++) {
+                result[i * channelData.length + ch] = channelData[ch][i];
+            }
+        }
+
+        return result;
     }
 
     drawWaveform(data, waveColor, bgColor, width, height) {
